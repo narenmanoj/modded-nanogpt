@@ -241,9 +241,12 @@ dist.barrier()
 assert 8 % dist.get_world_size() == 0
 
 # logging setup
+run_id = str(uuid.uuid4())
 if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
+    logfile = f"logs/{run_id}.txt"
+    hparams_file = f"logs/{run_id}_hyperparameters.txt"
+    open(hparams_file, "w").close()  # truncate so multiple log_hparam calls just append
     print(logfile)
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
@@ -252,6 +255,12 @@ def print0(s, console=False, log=True):
         if log:
             with open(logfile, "a") as f:
                 print(s, file=f)
+def log_hparam(s):
+    """Log to main logfile + console + a dedicated hyperparameters file (rank 0 only)."""
+    print0(s, console=True)
+    if dist.get_rank() == 0:
+        with open(hparams_file, "a") as f:
+            print(s, file=f)
 
 # we begin by logging this file itself
 print0(code)
@@ -279,7 +288,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--lookahead_alpha", type=float, default=0.0,
                     help="Approximate-extragradient lookahead strength for Muon. 0 = standard Muon.")
 args = parser.parse_args()
-print0(f"cli_args: {vars(args)}", console=True)
+log_hparam(f"cli_args: {vars(args)}")
 
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = 3500
@@ -302,6 +311,14 @@ assert set(p for opt in optimizers for group in opt.param_groups
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+# Log resolved optimizer hyperparameters so each run is self-describing.
+log_hparam(f"train_steps: {train_steps}")
+for opt_name, opt in [("optimizer1", optimizer1), ("optimizer2", optimizer2)]:
+    log_hparam(f"{opt_name}: {opt.__class__.__name__}")
+    for i, group in enumerate(opt.param_groups):
+        hp = {k: v for k, v in group.items() if k != "params"}
+        log_hparam(f"  group[{i}] (n_params={len(group['params'])}): {hp}")
 
 # learning rate schedule: stable then decay
 def set_hparams(step, cooldown_frac=0.7):
