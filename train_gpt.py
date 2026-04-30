@@ -426,6 +426,10 @@ class NorMuonAndAdam:
         self.scatter_order = scatter_order
         self.work_order = work_order
 
+        # Lookahead-extragradient strength: gradients are evaluated at
+        # W_t + alpha * (W_t - W_{t-1}) instead of at W_t. alpha = 0 disables.
+        self.lookahead_alpha = float(normuon_defaults.get("lookahead_alpha", 0.0))
+
         # Collect params by label and build config
         self.param_cfgs: dict[nn.Parameter, ParamConfig] = {}
         self.param_states: dict[nn.Parameter, dict] = {}
@@ -454,6 +458,7 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._eff_alpha_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -569,10 +574,18 @@ class NorMuonAndAdam:
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
+                # Lookahead delta: stores the shift applied at the end of the previous step
+                # (i.e., alpha * -eff_lr * polar(M_t)) so the next step can un-shift before
+                # the actual update. bf16 storage; cast to fp32 inside the fused op.
+                lookahead_delta = torch.zeros(
+                    chunk_shape, dtype=torch.bfloat16, device=param.device
+                )
+
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
+                    lookahead_delta=lookahead_delta,
                 )
 
     # -----------------------------------
@@ -646,6 +659,7 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                p_state["lookahead_delta"].zero_()
 
     def copy_lm_state_to_embed(self):
         """
@@ -887,20 +901,38 @@ class NorMuonAndAdam:
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
+        use_lookahead = self.lookahead_alpha != 0.0
+        if use_lookahead:
+            self._eff_alpha_t.fill_(self.lookahead_alpha)
+
         # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
         if p_cfg.per_matrix_lr_mul is not None:
             self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
+                if use_lookahead:
+                    NorMuonAndAdam._cautious_wd_update_with_lookahead_inplace(
+                        p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
+                        p_state["lookahead_delta"][mat_idx],
+                        self._eff_wd_t, self._eff_lr_t, self._eff_alpha_t,
+                    )
+                else:
+                    NorMuonAndAdam._cautious_wd_and_update_inplace(
+                        p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
+                        self._eff_wd_t, self._eff_lr_t
+                    )
+        else:
+            if use_lookahead:
+                NorMuonAndAdam._cautious_wd_update_with_lookahead_inplace(
+                    p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
+                    p_state["lookahead_delta"],
+                    self._eff_wd_t, self._eff_lr_t, self._eff_alpha_t,
+                )
+            else:
                 NorMuonAndAdam._cautious_wd_and_update_inplace(
-                    p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
+                    p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
                     self._eff_wd_t, self._eff_lr_t
                 )
-        else:
-            NorMuonAndAdam._cautious_wd_and_update_inplace(
-                p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
-                self._eff_wd_t, self._eff_lr_t
-            )
 
         return p_slice
 
@@ -921,6 +953,45 @@ class NorMuonAndAdam:
         p_precise = p_precise_raw.view(torch.float32)
         mask = (grad * p_precise) >= 0
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
+        p.copy_((p_precise_raw >> 16).to(torch.uint16))
+        mantissa.copy_(p_precise_raw.to(torch.uint16))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _cautious_wd_update_with_lookahead_inplace(
+        p, mantissa, grad, lookahead_delta, wd_tensor, lr_tensor, alpha_tensor,
+    ):
+        """
+        Fused approximate-extragradient step with mantissa precision tracking.
+
+        On entry the live param represents W̃_t = W_t + alpha * (W_t - W_{t-1}); we recover
+        W_t by subtracting the previously stored shift, apply the cautious WD + grad step
+        to get W_{t+1}, then store and apply the new shift = -alpha * lr * grad so the
+        gather'd param is W̃_{t+1} ready for next step's forward.
+
+        lookahead_delta is updated in place to hold the new shift.
+        """
+        assert p.dtype == mantissa.dtype == torch.uint16
+        grad = grad.float()
+        wd_factor = wd_tensor.to(torch.float32)
+        lr_factor = lr_tensor.to(torch.float32)
+        alpha_factor = alpha_tensor.to(torch.float32)
+
+        p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        p_precise = p_precise_raw.view(torch.float32)
+
+        # Un-shift to recover W_t
+        w_t = p_precise - lookahead_delta.float()
+
+        # Cautious WD + gradient step → W_{t+1}
+        mask = (grad * w_t) >= 0
+        w_next = w_t - (w_t * mask * wd_factor * lr_factor) - (grad * lr_factor)
+
+        # New shift = -alpha * lr * grad; final live value = W_{t+1} + new_shift = W̃_{t+1}
+        new_shift = -(grad * alpha_factor * lr_factor)
+        p_precise.copy_(w_next + new_shift)
+        lookahead_delta.copy_(new_shift.to(lookahead_delta.dtype))
+
         p.copy_((p_precise_raw >> 16).to(torch.uint16))
         mantissa.copy_(p_precise_raw.to(torch.uint16))
 
@@ -1729,6 +1800,9 @@ class TrainingManager():
             momentum=0.95,
             beta2=0.9,
             weight_decay=1.2,
+            # Approximate-extragradient lookahead: gradient evaluated at
+            # W_t + alpha * (W_t - W_{t-1}). 0.0 = disabled (standard Muon).
+            lookahead_alpha=0.0,
         )
 
         self.optimizer = NorMuonAndAdam(

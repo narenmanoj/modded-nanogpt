@@ -193,10 +193,10 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, lookahead_alpha=0.0):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, lookahead_alpha=lookahead_alpha)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -206,15 +206,24 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            alpha = group["lookahead_alpha"]
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
+                        state["lookahead_delta"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    # Un-shift: grad was evaluated at W_t + alpha*(W_t - W_{t-1}); recover W_t.
+                    if alpha != 0.0:
+                        p.sub_(state["lookahead_delta"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
+                    # Store new shift; gathered value is the lookahead point for next step's forward.
+                    if alpha != 0.0:
+                        state["lookahead_delta"].copy_(update).mul_(-alpha * group["lr"])
+                        p.add_(state["lookahead_delta"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
