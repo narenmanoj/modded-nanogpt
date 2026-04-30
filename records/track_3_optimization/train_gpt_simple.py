@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 from torch.optim import AdamW
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 import torch.distributed as dist
 
@@ -242,12 +243,14 @@ assert 8 % dist.get_world_size() == 0
 
 # logging setup
 run_id = str(uuid.uuid4())
+writer = None
 if dist.get_rank() == 0:
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     hparams_file = f"logs/{run_id}_hyperparameters.txt"
     open(hparams_file, "w").close()  # truncate so multiple log_hparam calls just append
     print(logfile)
+    writer = SummaryWriter(log_dir=f"runs/{run_id}")
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
         if console:
@@ -360,6 +363,9 @@ for step in range(train_steps + 1):
         val_loss /= val_tokens
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
                + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+        if writer is not None:
+            writer.add_scalar("loss/val", val_loss.item(), step)
+            writer.flush()
         model.train()
         # start the clock again
         dist.barrier()
@@ -372,18 +378,36 @@ for step in range(train_steps + 1):
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
+    local_loss = torch.zeros((), device="cuda")
     for i in range(len(inputs) // mbs):
-        model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+        loss.backward()
+        local_loss += loss.detach()
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    # gather train-loss + global grad norm before the optimizer mutates grads/params
+    if writer is not None:
+        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+        train_loss = local_loss / batch_size
+        grad_norm = torch.stack([p.grad.detach().float().pow(2).sum()
+                                 for p in model.parameters()]).sum().sqrt()
     # set optimization hyperparameters and take a step
     set_hparams(step)
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    if writer is not None:
+        writer.add_scalar("loss/train", train_loss.item(), step + 1)
+        writer.add_scalar("grad_norm", grad_norm.item(), step + 1)
+        writer.add_scalar("lr/muon", optimizer2.param_groups[0]["lr"], step + 1)
+        writer.add_scalar("lr/adamw_embed", optimizer1.param_groups[0]["lr"], step + 1)
+        writer.add_scalar("lr/adamw_proj", optimizer1.param_groups[1]["lr"], step + 1)
+        writer.add_scalar("lr/adamw_scalars", optimizer1.param_groups[2]["lr"], step + 1)
     approx_training_time = training_time + (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
            + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
+if writer is not None:
+    writer.close()
 dist.destroy_process_group()
