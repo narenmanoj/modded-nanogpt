@@ -9,6 +9,7 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import argparse
 import uuid
 import time
 from pathlib import Path
@@ -273,6 +274,13 @@ model.compile(dynamic=False)
 #       Init & Optim Hyperparams       #
 ########################################
 
+# CLI args for sweeping. Logged below so the chosen values are recoverable from the logfile.
+parser = argparse.ArgumentParser()
+parser.add_argument("--lookahead_alpha", type=float, default=0.0,
+                    help="Approximate-extragradient lookahead strength for Muon. 0 = standard Muon.")
+args = parser.parse_args()
+print0(f"cli_args: {vars(args)}", console=True)
+
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = 3500
 
@@ -287,7 +295,7 @@ optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                  lr=0.025, weight_decay=0.0125)
+                  lr=0.025, weight_decay=0.0125, lookahead_alpha=args.lookahead_alpha)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
