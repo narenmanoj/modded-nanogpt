@@ -262,7 +262,6 @@ if dist.get_rank() == 0:
     hparams_file = f"logs/{run_id}_hyperparameters.txt"
     open(hparams_file, "w").close()  # truncate so multiple log_hparam calls just append
     print(logfile)
-    writer = SummaryWriter(log_dir=f"runs/{run_id}")
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
         if console:
@@ -312,6 +311,18 @@ parser.add_argument("--lookahead_mode", choices=("deterministic", "gaussian"),
                          "alpha=1 the expected spectral norm matches the previous step's spectral norm.")
 args = parser.parse_args()
 log_hparam(f"cli_args: {vars(args)}")
+
+# build a human-readable tensorboard run name encoding the perturbation regime
+def _run_tag(alpha: float, mode: str) -> str:
+    if alpha == 0.0:
+        return "baseline"
+    if mode == "gaussian":
+        return f"gaussian_a{alpha:g}"
+    return (f"optimism_a{alpha:g}" if alpha > 0 else f"pessimism_a{abs(alpha):g}")
+if dist.get_rank() == 0:
+    run_tag = _run_tag(args.lookahead_alpha, args.lookahead_mode)
+    writer = SummaryWriter(log_dir=f"runs/{run_tag}_{run_id[:8]}")
+    log_hparam(f"tensorboard run dir: runs/{run_tag}_{run_id[:8]}")
 
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = 3500
