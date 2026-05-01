@@ -195,10 +195,13 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, lookahead_alpha=0.0):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95,
+                 lookahead_alpha=0.0, lookahead_mode="deterministic"):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        assert lookahead_mode in ("deterministic", "gaussian")
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, lookahead_alpha=lookahead_alpha)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu,
+                        lookahead_alpha=lookahead_alpha, lookahead_mode=lookahead_mode)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -209,6 +212,7 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
             alpha = group["lookahead_alpha"]
+            mode = group["lookahead_mode"]
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
@@ -217,14 +221,22 @@ class Muon(torch.optim.Optimizer):
                         state["momentum"] = torch.zeros_like(p)
                         state["lookahead_delta"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    # Un-shift: grad was evaluated at W_t + alpha*(W_t - W_{t-1}); recover W_t.
+                    # Un-shift: grad was evaluated at W_t + (perturbation); recover W_t.
                     if alpha != 0.0:
                         p.sub_(state["lookahead_delta"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
-                    # Store new shift; gathered value is the lookahead point for next step's forward.
+                    # Store new shift; gathered value is the lookahead/perturbed point for next step's forward.
                     if alpha != 0.0:
-                        state["lookahead_delta"].copy_(update).mul_(-alpha * group["lr"])
+                        if mode == "deterministic":
+                            # Optimism (alpha>0) / pessimism (alpha<0) along the previous update direction.
+                            state["lookahead_delta"].copy_(update).mul_(-alpha * group["lr"])
+                        else:  # gaussian
+                            # i.i.d. N(0, s^2) with s chosen so E[||xi||_op] = lr * max(1, sqrt(m/n))
+                            # at alpha=1, matching the deterministic shift's spectral norm.
+                            m, n = p.shape[-2], p.shape[-1]
+                            s = group["lr"] * max(1.0, (m / n) ** 0.5) / (m ** 0.5 + n ** 0.5)
+                            state["lookahead_delta"].normal_(0.0, s).mul_(alpha)
                         p.add_(state["lookahead_delta"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
@@ -289,7 +301,15 @@ model.compile(dynamic=False)
 # CLI args for sweeping. Logged below so the chosen values are recoverable from the logfile.
 parser = argparse.ArgumentParser()
 parser.add_argument("--lookahead_alpha", type=float, default=0.0,
-                    help="Approximate-extragradient lookahead strength for Muon. 0 = standard Muon.")
+                    help="Perturbation strength for Muon. 0 = standard Muon. "
+                         "alpha=1 shifts the gradient query point by an amount whose operator "
+                         "norm equals (or, for gaussian mode, has expected operator norm equal to) "
+                         "||x_t - x_{t-1}||_op.")
+parser.add_argument("--lookahead_mode", choices=("deterministic", "gaussian"),
+                    default="deterministic",
+                    help="deterministic: shift along previous update direction (optimism if alpha>0, "
+                         "pessimism if alpha<0). gaussian: i.i.d. Gaussian shift, scaled so that at "
+                         "alpha=1 the expected spectral norm matches the previous step's spectral norm.")
 args = parser.parse_args()
 log_hparam(f"cli_args: {vars(args)}")
 
@@ -307,7 +327,9 @@ optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
 optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                  lr=0.025, weight_decay=0.0125, lookahead_alpha=args.lookahead_alpha)
+                  lr=0.025, weight_decay=0.0125,
+                  lookahead_alpha=args.lookahead_alpha,
+                  lookahead_mode=args.lookahead_mode)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
