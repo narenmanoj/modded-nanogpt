@@ -341,8 +341,8 @@ def _run_tag(alpha: float, mode: str) -> str:
     if alpha == 0.0:
         return "baseline"
     if mode == "gaussian":
-        return f"gaussian_a{alpha:g}"
-    return (f"optimism_a{alpha:g}" if alpha > 0 else f"pessimism_a{abs(alpha):g}")
+        return f"gaussian_a_{alpha:g}"
+    return (f"optimism_a_{alpha:g}" if alpha > 0 else f"pessimism_a_{abs(alpha):g}")
 if dist.get_rank() == 0:
     run_tag = _run_tag(args.lookahead_alpha, args.lookahead_mode)
     writer = SummaryWriter(log_dir=f"runs/{run_tag}_{run_id[:8]}")
