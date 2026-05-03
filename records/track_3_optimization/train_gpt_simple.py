@@ -205,7 +205,27 @@ class Muon(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self):
+    def un_shift_inplace(self):
+        """Subtract each param's lookahead_delta in place and all-gather, so the live params
+        become W_t (un-shifted) on every rank. Pair with step(skip_unshift=True) to avoid
+        double-un-shifting. Used to run a no_grad forward at the unperturbed weights for diagnostics."""
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            if group["lookahead_alpha"] == 0.0:
+                continue
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if "lookahead_delta" in state:
+                        p.sub_(state["lookahead_delta"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+    @torch.no_grad()
+    def step(self, skip_unshift=False):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         for group in self.param_groups:
@@ -222,7 +242,8 @@ class Muon(torch.optim.Optimizer):
                         state["lookahead_delta"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum"], mu=group["mu"])
                     # Un-shift: grad was evaluated at W_t + (perturbation); recover W_t.
-                    if alpha != 0.0:
+                    # skip_unshift=True when caller already un-shifted via un_shift_inplace().
+                    if alpha != 0.0 and not skip_unshift:
                         p.sub_(state["lookahead_delta"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
@@ -232,11 +253,14 @@ class Muon(torch.optim.Optimizer):
                             # Optimism (alpha>0) / pessimism (alpha<0) along the previous update direction.
                             state["lookahead_delta"].copy_(update).mul_(-alpha * group["lr"])
                         else:  # gaussian
-                            # i.i.d. N(0, s^2) with s chosen so E[||xi||_op] = lr * max(1, sqrt(m/n))
-                            # at alpha=1, matching the deterministic shift's spectral norm.
+                            # i.i.d. N(0, s^2) with s chosen so E[||xi||_op] ≈ |alpha| * ||p||_op:
+                            # the perturbation magnitude is alpha times the current weight's spectral
+                            # norm, so alpha is a unit-free fraction of the weight scale (no LR mixing).
+                            # Cost: one SVD per Muon-managed param per step.
+                            weight_op = torch.linalg.matrix_norm(p.float(), ord=2)
                             m, n = p.shape[-2], p.shape[-1]
-                            s = group["lr"] * max(1.0, (m / n) ** 0.5) / (m ** 0.5 + n ** 0.5)
-                            state["lookahead_delta"].normal_(0.0, s).mul_(alpha)
+                            state["lookahead_delta"].normal_(0.0, 1.0)
+                            state["lookahead_delta"].mul_(weight_op * (alpha / (m ** 0.5 + n ** 0.5)))
                         p.add_(state["lookahead_delta"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
@@ -325,7 +349,7 @@ if dist.get_rank() == 0:
     log_hparam(f"tensorboard run dir: runs/{run_tag}_{run_id[:8]}")
 
 # we want to minimize this while still reaching 3.28 val loss
-train_steps = 3500
+train_steps = 7000
 
 # initialize model parameters
 for name, p in model.named_parameters():
@@ -347,6 +371,9 @@ assert set(p for opt in optimizers for group in opt.param_groups
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+
+# Map params to names for per-tensor tensorboard logging.
+name_by_param = {p: n for n, p in model.named_parameters()}
 
 # Log resolved optimizer hyperparameters so each run is self-describing.
 log_hparam(f"train_steps: {train_steps}")
@@ -411,32 +438,72 @@ for step in range(train_steps + 1):
     inputs, targets = next(train_loader)
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
-    local_loss = torch.zeros((), device="cuda")
+    # Perturbed forward+backward: live Muon params are W̃_t = W_t + (perturbation), so this
+    # produces the loss that the optimizer's gradient is evaluated against.
+    local_loss_perturbed = torch.zeros((), device="cuda")
     for i in range(len(inputs) // mbs):
         loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
         loss.backward()
-        local_loss += loss.detach()
+        local_loss_perturbed += loss.detach()
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+
+    # Unperturbed forward (no_grad): un-shift Muon params to W_t and re-run forward on the same
+    # microbatches. The optimizer.step() call below uses skip_unshift=True so it won't re-un-shift.
+    local_loss_unperturbed = None
+    if args.lookahead_alpha != 0.0:
+        optimizer2.un_shift_inplace()
+        local_loss_unperturbed = torch.zeros((), device="cuda")
+        with torch.no_grad():
+            for i in range(len(inputs) // mbs):
+                local_loss_unperturbed += model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+
     # gather train-loss + global grad norm before the optimizer mutates grads/params
     if writer is not None:
-        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
-        train_loss = local_loss / batch_size
+        dist.all_reduce(local_loss_perturbed, op=dist.ReduceOp.SUM)
+        train_loss_perturbed = local_loss_perturbed / batch_size
+        if local_loss_unperturbed is not None:
+            dist.all_reduce(local_loss_unperturbed, op=dist.ReduceOp.SUM)
+            train_loss_unperturbed = local_loss_unperturbed / batch_size
         grad_norm = torch.stack([p.grad.detach().float().pow(2).sum()
                                  for p in model.parameters()]).sum().sqrt()
     # set optimization hyperparameters and take a step
     set_hparams(step)
-    for opt in optimizers:
-        opt.step()
+    optimizer1.step()
+    optimizer2.step(skip_unshift=local_loss_unperturbed is not None)
     model.zero_grad(set_to_none=True)
     if writer is not None:
-        writer.add_scalar("loss/train", train_loss.item(), step + 1)
+        writer.add_scalar("loss/train_perturbed", train_loss_perturbed.item(), step + 1)
+        if local_loss_unperturbed is not None:
+            writer.add_scalar("loss/train_unperturbed", train_loss_unperturbed.item(), step + 1)
+            writer.add_scalar("loss/perturbation_cost",
+                              (train_loss_perturbed - train_loss_unperturbed).item(), step + 1)
         writer.add_scalar("grad_norm", grad_norm.item(), step + 1)
         writer.add_scalar("lr/muon", optimizer2.param_groups[0]["lr"], step + 1)
         writer.add_scalar("lr/adamw_embed", optimizer1.param_groups[0]["lr"], step + 1)
         writer.add_scalar("lr/adamw_proj", optimizer1.param_groups[1]["lr"], step + 1)
         writer.add_scalar("lr/adamw_scalars", optimizer1.param_groups[2]["lr"], step + 1)
+        # Per-Muon-param perturbation size relative to current weights.
+        # Muon shards param updates across ranks, so optimizer2.state on rank 0 only contains
+        # the subset of params this rank actually updated — that's the slice we log.
+        if args.lookahead_alpha != 0.0:
+            with torch.no_grad():
+                for p, pstate in optimizer2.state.items():
+                    if "lookahead_delta" not in pstate:
+                        continue
+                    pname = name_by_param.get(p)
+                    if pname is None:
+                        continue
+                    delta = pstate["lookahead_delta"]
+                    delta_op = torch.linalg.matrix_norm(delta.float(), ord=2)
+                    weight_op = torch.linalg.matrix_norm(p.float(), ord=2)
+                    delta_fro = delta.float().norm()
+                    weight_fro = p.float().norm()
+                    writer.add_scalar(f"perturb/{pname}/delta_op_over_weight_op",
+                                      (delta_op / (weight_op + 1e-12)).item(), step + 1)
+                    writer.add_scalar(f"perturb/{pname}/delta_fro_over_weight_fro",
+                                      (delta_fro / (weight_fro + 1e-12)).item(), step + 1)
     approx_training_time = training_time + (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
            + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
