@@ -194,6 +194,19 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
+
+def momentum_update(direction: Tensor, momentum: Tensor, mu=0.95, nesterov=True) -> Tensor:
+    """Same Nesterov-style momentum convention as muon_update, but without
+    the matrix-sign / Newton-Schulz projection.
+    """
+    momentum.lerp_(direction, 1 - mu)
+    return direction.lerp(momentum, mu) if nesterov else momentum
+
+
+def row_l2_normalize(x: Tensor, eps: float = 1e-12) -> Tensor:
+    """Row-wise vector sign: x[i] / ||x[i]||_2, with zero rows left at zero."""
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95,
                  lookahead_alpha=0.0, lookahead_mode="deterministic"):
@@ -364,6 +377,166 @@ class NewtonMuon(torch.optim.Optimizer):
             self._n_accum[k] = 0
 
 
+class RowNormPullback(torch.optim.Optimizer):
+    """
+    Row-norm + pullback optimizer.
+
+    For a Linear layer y = z W^T, let A = dL/dy be the activation-output
+    gradient and K = E[z z^T]. The sharp ||.||_{infty,2} derivation gives
+
+        Delta y = -lr * rsgn(A),
+
+    where rsgn normalizes every token row of A to unit l2 norm. The minimum
+    Frobenius-norm pullback to the PyTorch weight W is
+
+        Delta W = -lr * E[rsgn(A)^T z] K^{-1}.
+
+    This class estimates E[rsgn(A)^T z] with a backward hook on each supplied
+    Linear module, estimates K with the same input hooks/statistics used by
+    NewtonMuon, and applies the pulled-back direction directly. Optional
+    parameter-space momentum can be enabled with mu > 0; setting mu=0 recovers
+    the literal one-step row-norm pullback direction.
+
+    Important implementation note: in this manually-sharded DDP setup, only the
+    rank that owns a parameter accumulates its local activation/output-gradient
+    statistics, matching NewtonMuon's ownership pattern. That is a stochastic
+    local estimate of the pullback statistics, while p.grad is still all-reduced
+    by the training loop.
+    """
+    def __init__(self, params_and_modules, lr=0.025, weight_decay=0.0125, mu=0.0,
+                 beta=0.95, gamma=0.2, eps=1e-8, refresh_k=1, row_eps=1e-12,
+                 lookahead_alpha=0.0, lookahead_mode="deterministic"):
+        assert isinstance(params_and_modules, list) and len(params_and_modules) >= 1
+        assert lookahead_mode in ("deterministic", "gaussian")
+        pairs = sorted(params_and_modules, key=lambda pm: pm[0].size(), reverse=True)
+        params = [p for p, _ in pairs]
+        assert isinstance(params[0], torch.nn.Parameter)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu,
+                        beta=beta, gamma=gamma, eps=eps, refresh_k=refresh_k,
+                        row_eps=row_eps, lookahead_alpha=lookahead_alpha,
+                        lookahead_mode=lookahead_mode)
+        super().__init__(params, defaults)
+        self._row_eps = row_eps
+
+        world_size = dist.get_world_size()
+        my_rank = dist.get_rank()
+        self._owns = {id(p): (i % world_size) == my_rank for i, p in enumerate(params)}
+
+        # Accumulators for the rank-local estimate of
+        #   K_num = sum z_i z_i^T,
+        #   RZ_num = sum rsgn(a_i)^T z_i.
+        self._zz_accum = {}   # id(param) -> (n, n)
+        self._rz_accum = {}   # id(param) -> (m, n)
+        self._n_accum = {}    # id(param) -> int row/token count
+        self._hooks = []
+        for p, m in pairs:
+            # Need a forward hook rather than a pre-hook because we attach a
+            # tensor hook to the Linear output to see dL/dy during backward.
+            self._hooks.append(m.register_forward_hook(self._make_hook(p)))
+
+    def _make_hook(self, param):
+        key = id(param)
+        def hook(module, args, output):
+            if not module.training:
+                return
+            if not self._owns.get(key, False):
+                return
+            if not torch.is_tensor(output) or not output.requires_grad:
+                return
+
+            # Save only the detached input. The closure is released once the
+            # output-gradient hook has fired for this microbatch.
+            x = args[0].detach()
+
+            def output_grad_hook(grad_out):
+                z = x.reshape(-1, x.size(-1)).float()        # (N_local, n)
+                a = grad_out.detach().reshape(-1, grad_out.size(-1)).float()  # (N_local, m)
+                u = row_l2_normalize(a, eps=self._row_eps)   # rsgn(A), rowwise
+                n_in = z.size(-1)
+                n_out = u.size(-1)
+                if key not in self._zz_accum:
+                    self._zz_accum[key] = torch.zeros(n_in, n_in, device=z.device, dtype=torch.float32)
+                    self._rz_accum[key] = torch.zeros(n_out, n_in, device=z.device, dtype=torch.float32)
+                    self._n_accum[key] = 0
+                self._zz_accum[key].addmm_(z.T, z)
+                self._rz_accum[key].addmm_(u.T, z)
+                self._n_accum[key] += z.size(0)
+
+            output.register_hook(output_grad_hook)
+        return hook
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            alpha = group["lookahead_alpha"]
+            mode = group["lookahead_mode"]
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    n_in = p.shape[-1]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                        state["lookahead_delta"] = torch.zeros_like(p)
+                        state["K"] = 1e-3 * torch.eye(n_in, device=p.device, dtype=torch.float32)
+                        state["Kinv"] = _ridged_inv(state["K"], group["gamma"], group["eps"])
+                        state["step_count"] = 0
+                    state["step_count"] += 1
+
+                    key = id(p)
+                    N = self._n_accum.get(key, 0)
+
+                    # Since the pullback scale matters, refresh on the first step
+                    # whenever data is available, and thereafter every refresh_k.
+                    should_refresh = (state["step_count"] == 1) or (state["step_count"] % group["refresh_k"] == 0)
+                    if should_refresh and key in self._zz_accum and N > 0:
+                        beta = group["beta"]
+                        K_batch = self._zz_accum[key] / N
+                        if state["step_count"] == 1:
+                            # For row-pullback, unlike Muon, the absolute scale
+                            # of K^{-1} matters; do not start from a tiny-K EWMA.
+                            state["K"].copy_(K_batch)
+                        else:
+                            state["K"].mul_(beta).add_(K_batch, alpha=1 - beta)
+                        state["Kinv"] = _ridged_inv(state["K"], group["gamma"], group["eps"])
+
+                    if key in self._rz_accum and N > 0:
+                        # E[rsgn(A)^T z] K^{-1}. This is the positive
+                        # gradient-like direction; we subtract lr * update below.
+                        rz = self._rz_accum[key] / N
+                        direction = (rz @ state["Kinv"]).to(p.dtype)
+                    else:
+                        # Defensive fallback: if hooks did not fire, use a cruder
+                        # row-normalized Newton-Muon-like parameter-space direction.
+                        g_precond = (p.grad.float() @ state["Kinv"])
+                        direction = row_l2_normalize(g_precond, eps=group["row_eps"]).to(p.dtype)
+
+                    update = momentum_update(direction, state["momentum"], mu=group["mu"])
+
+                    if alpha != 0.0:
+                        p.sub_(state["lookahead_delta"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                    if alpha != 0.0:
+                        if mode == "deterministic":
+                            state["lookahead_delta"].copy_(update).mul_(-alpha * group["lr"])
+                        else:  # gaussian; kept in the same parameter-space scaling as Muon/NewtonMuon
+                            m, n = p.shape[-2], p.shape[-1]
+                            s = group["lr"] * max(1.0, (m / n) ** 0.5) / (m ** 0.5 + n ** 0.5)
+                            state["lookahead_delta"].normal_(0.0, s).mul_(alpha)
+                        p.add_(state["lookahead_delta"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+        for k in self._zz_accum:
+            self._zz_accum[k].zero_()
+            self._rz_accum[k].zero_()
+            self._n_accum[k] = 0
+
+
 ########################################
 #                Setup                 #
 ########################################
@@ -422,7 +595,7 @@ model.compile(dynamic=False)
 
 # CLI args for sweeping. Logged below so the chosen values are recoverable from the logfile.
 parser = argparse.ArgumentParser()
-parser.add_argument("--optimizer", choices=("muon", "newton_muon"), default="muon",
+parser.add_argument("--optimizer", choices=("muon", "newton_muon", "row_pullback"), default="muon",
                     help="Optimizer for the 2D weights inside transformer blocks. "
                          "AdamW is always used for embed/proj/scalar params.")
 parser.add_argument("--lookahead_alpha", type=float, default=0.0,
@@ -443,12 +616,24 @@ parser.add_argument("--nm_eps", type=float, default=1e-8,
                     help="(newton_muon) Additive epsilon in the ridge for numerical stability.")
 parser.add_argument("--nm_refresh_k", type=int, default=32,
                     help="(newton_muon) Recompute K (and its inverse) every this many steps.")
+parser.add_argument("--rpb_beta", type=float, default=0.95,
+                    help="(row_pullback) EWMA decay on the input Gram matrix K.")
+parser.add_argument("--rpb_gamma", type=float, default=0.2,
+                    help="(row_pullback) Ridge scale for K^{-1}.")
+parser.add_argument("--rpb_eps", type=float, default=1e-8,
+                    help="(row_pullback) Additive epsilon in the ridge for numerical stability.")
+parser.add_argument("--rpb_refresh_k", type=int, default=1,
+                    help="(row_pullback) Refresh K^{-1} every this many steps. Default 1 because pullback scale matters.")
+parser.add_argument("--rpb_mu", type=float, default=0.0,
+                    help="(row_pullback) Optional parameter-space momentum after the pullback. 0.0 is the literal derivation; 0.95 is Muon-like.")
+parser.add_argument("--rpb_row_eps", type=float, default=1e-12,
+                    help="(row_pullback) Epsilon for row-wise output-gradient normalization.")
 args = parser.parse_args()
 log_hparam(f"cli_args: {vars(args)}")
 
 # build a human-readable tensorboard run name encoding the optimizer + perturbation regime
 def _run_tag(optimizer: str, alpha: float, mode: str) -> str:
-    opt_prefix = {"muon": "muon", "newton_muon": "nm"}[optimizer]
+    opt_prefix = {"muon": "muon", "newton_muon": "nm", "row_pullback": "rpb"}[optimizer]
     if alpha == 0.0:
         regime = "baseline"
     elif mode == "gaussian":
@@ -493,6 +678,21 @@ elif args.optimizer == "newton_muon":
                             refresh_k=args.nm_refresh_k,
                             lookahead_alpha=args.lookahead_alpha,
                             lookahead_mode=args.lookahead_mode)
+elif args.optimizer == "row_pullback":
+    rpb_pairs = []
+    for m in model.blocks.modules():
+        if isinstance(m, nn.Linear) and m.weight.ndim >= 2:
+            rpb_pairs.append((m.weight, m))
+    expected = set(p for p in model.blocks.parameters() if p.ndim >= 2)
+    assert set(p for p, _ in rpb_pairs) == expected, \
+        "RowNormPullback-collected Linear weights must match the Muon param set"
+    optimizer2 = RowNormPullback(rpb_pairs,
+                                 lr=0.025, weight_decay=0.0125,
+                                 mu=args.rpb_mu,
+                                 beta=args.rpb_beta, gamma=args.rpb_gamma, eps=args.rpb_eps,
+                                 refresh_k=args.rpb_refresh_k, row_eps=args.rpb_row_eps,
+                                 lookahead_alpha=args.lookahead_alpha,
+                                 lookahead_mode=args.lookahead_mode)
 else:
     raise ValueError(f"unknown optimizer: {args.optimizer}")
 optimizers = [optimizer1, optimizer2]
