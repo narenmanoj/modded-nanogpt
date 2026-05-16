@@ -529,7 +529,6 @@ if checkpoint_main is not None:
 def _run_tag(optimizer: str, alpha: float, mode: str) -> str:
     opt_prefix = {"muon": "muon", "newton_muon": "nm"}[optimizer]
     if alpha == 0.0:
-<<<<<<< HEAD
         regime = "baseline"
     elif mode == "gaussian":
         regime = f"gaussian_a{alpha:g}"
@@ -540,18 +539,6 @@ if dist.get_rank() == 0:
     run_tag = _run_tag(args.optimizer, args.lookahead_alpha, args.lookahead_mode)
     writer = SummaryWriter(log_dir=f"runs/{run_tag}_{run_id[:8]}")
     log_hparam(f"tensorboard run dir: runs/{run_tag}_{run_id[:8]}")
-=======
-        return "baseline"
-    if mode == "gaussian":
-        return f"gaussian_a_{alpha:g}"
-    return (f"optimism_a_{alpha:g}" if alpha > 0 else f"pessimism_a_{abs(alpha):g}")
-run_tag = _run_tag(args.lookahead_alpha, args.lookahead_mode)
-log_dir = f"runs/{run_tag}_{tb_run_id[:8]}"
-ckpt_dir = f"{log_dir}/checkpoint"
-if dist.get_rank() == 0:
-    writer = SummaryWriter(log_dir=log_dir)
-    log_hparam(f"tensorboard run dir: {log_dir}")
->>>>>>> 70d4c5d3fa546c6ae4c86de4de0b7223bf08c24f
 
 # we want to minimize this while still reaching 3.28 val loss
 train_steps = 7000
