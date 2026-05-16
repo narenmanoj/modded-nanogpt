@@ -581,7 +581,6 @@ print0("="*100)
 
 val_tokens = 20 * 524288
 batch_size = 8 * 64 * 1024
-mbs = 16
 train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
@@ -628,7 +627,12 @@ parser.add_argument("--rpb_mu", type=float, default=0.0,
                     help="(row_pullback) Optional parameter-space momentum after the pullback. 0.0 is the literal derivation; 0.95 is Muon-like.")
 parser.add_argument("--rpb_row_eps", type=float, default=1e-12,
                     help="(row_pullback) Epsilon for row-wise output-gradient normalization.")
+parser.add_argument("--mbs", type=int, default=64,
+                    help="Microbatch size in *sequences* (each is seq_len=1024 tokens). "
+                         "Affects VRAM but not optimization: the global batch is fixed. "
+                         "Must divide len(inputs) and len(val_inputs).")
 args = parser.parse_args()
+mbs = args.mbs
 log_hparam(f"cli_args: {vars(args)}")
 
 # build a human-readable tensorboard run name encoding the optimizer + perturbation regime

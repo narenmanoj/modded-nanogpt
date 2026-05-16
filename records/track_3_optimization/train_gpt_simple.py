@@ -452,7 +452,6 @@ print0("="*100)
 
 val_tokens = 20 * 524288
 batch_size = 8 * 64 * 1024
-mbs = 64
 train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
@@ -479,7 +478,6 @@ parser.add_argument("--lookahead_mode", choices=("deterministic", "gaussian"),
                     help="deterministic: shift along previous update direction (optimism if alpha>0, "
                          "pessimism if alpha<0). gaussian: i.i.d. Gaussian shift, scaled so that at "
                          "alpha=1 the expected spectral norm matches the previous step's spectral norm.")
-<<<<<<< HEAD
 parser.add_argument("--nm_beta", type=float, default=0.95,
                     help="(newton_muon) EWMA decay on the input Gram matrix K.")
 parser.add_argument("--nm_gamma", type=float, default=0.2,
@@ -488,7 +486,6 @@ parser.add_argument("--nm_eps", type=float, default=1e-8,
                     help="(newton_muon) Additive epsilon in the ridge for numerical stability.")
 parser.add_argument("--nm_refresh_k", type=int, default=32,
                     help="(newton_muon) Recompute K (and its inverse) every this many steps.")
-=======
 parser.add_argument("--resume", type=str, default=None,
                     help="Path to a checkpoint dir (e.g. runs/<tag>_<uuid8>/checkpoint) to resume "
                          "from. The saved values of lookahead_alpha and lookahead_mode override the "
@@ -501,8 +498,12 @@ parser.add_argument("--perturb_log_every", type=int, default=25,
                          "Each call does 2 full SVDs per Muon param this rank owns, so heavy "
                          "throttling matters when the algorithmic cost (Gaussian SVD, extra "
                          "forward pass) is already large.")
->>>>>>> 70d4c5d3fa546c6ae4c86de4de0b7223bf08c24f
+parser.add_argument("--mbs", type=int, default=64,
+                    help="Microbatch size in *sequences* (each is seq_len=1024 tokens). "
+                         "Affects VRAM but not optimization: the global batch is fixed. "
+                         "Must divide len(inputs) and len(val_inputs).")
 args = parser.parse_args()
+mbs = args.mbs
 
 # Resume: load main metadata BEFORE building paths so we can re-target tensorboard + checkpoint
 # at the original run's directory, and override perturbation args to match the saved optimizer.
